@@ -4,6 +4,7 @@
 #define DEBUG_MODE
 
 #define MAX_FILE_SIZE (1024*1024*1024)
+#define IO_SIGNAL SIGUSR1
 
 #ifdef DEBUG_MODE
 #define print_log(...) \

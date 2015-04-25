@@ -11,10 +11,12 @@
 #include <string.h> 	//memcpy
 #include <stdbool.h>	//boolean
 #include <time.h>	//time()
+#include <signal.h>
+#include <unistd.h>
 #include "./WLGenerator.h"
 
 
-	struct aiocb *aiocbp[32];
+
 
 static uint64_t utime_calculator(struct timeval *s, struct timeval *e){
  	long sec, usec;
@@ -34,42 +36,37 @@ static uint64_t utime_calculator(struct timeval *s, struct timeval *e){
 	return sec*1000000ULL + usec;
 }
 
-//static void io_completion_handler(sigval_t sigval){
-static void io_completion_handler(struct aiocb *aio){
-	int rtn;
+static void io_completion_handler(int sig, siginfo_t *si, void *ucontext){
 	struct aiocb *aiocbp;
+	int rtn;
 	int reqID;
 	int i=1;
 	
-	aiocbp = aio;
-	//aiocbp = (struct aiocb *)sigval.sival_ptr;
-	//reqID = (int)sigval.sival_int;
-	while(1){ 
-	    if(aio_error(aiocbp) == 0 ){
-		rtn = aio_return(aiocbp);
-		print_log("\n %s : IO succeeded : reqID=%d, rtn=%d\n", __func__, reqID, rtn);
-		break;
-	    }else{
-		print_log("%s : IO failed : reqID=%d, rtn=%d", __func__, reqID, rtn);
+	if(si->si_signo == IO_SIGNAL){
+	    aiocbp = (struct aiocb *)si->si_value.sival_ptr;
+	    reqID = (int)si->si_value.sival_int;
+	    while(1){ 
+		if(aio_error(aiocbp) == 0 ){
+		    rtn = aio_return(aiocbp);
+		    print_log("\n %s : IO succeeded : reqID=%d, rtn=%d\n", __func__, reqID, rtn);
+		    break;
+		}else{
+		    print_log("%s : IO failed : reqID=%d, rtn=%d", __func__, reqID, rtn);
+		}
 	    }
-	}
 
-	print_log("%s : reqID=%d\n", __func__, reqID);
+	    print_log("%s : reqID=%d\n", __func__, reqID);
+	}
 }
 
-static void io_initialize(struct aiocb * aiocbp, int fd, char *buf, 
-	unsigned int buflen, unsigned long long offset, int reqID){
+static void io_initialize(struct aiocb * aiocbp, int fd, 
+	unsigned int buflen, int fileOffset, int reqID){
  
 	aiocbp->aio_fildes = fd;
-	aiocbp->aio_buf = buf;
 	aiocbp->aio_nbytes = buflen;
-	aiocbp->aio_offset = offset;
+	aiocbp->aio_offset = fileOffset;
 
-	/*aiocbp->aio_sigevent.sigev_notify = SIGEV_THREAD;
-	aiocbp->aio_sigevent.sigev_notify_function = io_completion_handler;
-	aiocbp->aio_sigevent.sigev_notify_attributes = NULL;
-	aiocbp->aio_sigevent.sigev_value.sival_ptr = aiocbp;
-	aiocbp->aio_sigevent.sigev_value.sival_int = reqID;*/
+	aiocbp->aio_reqprio = 0;
 }
 
 static int io_enqueue(IO_DIR direction, struct aiocb *aiocbp){
@@ -85,7 +82,7 @@ static int io_enqueue(IO_DIR direction, struct aiocb *aiocbp){
 		    __func__, direction, rtn);
 	    exit(1);
 	}else{
-	    print_log("%s : IO_DIR : %d\n", __func__, rtn);
+	    //print_log("%s : IO_DIR : %d\n", __func__, rtn);
 	}
 	return rtn;
 }
@@ -130,38 +127,51 @@ static int mem_allocation(char **buf, int reqSize, bool align){
 	    return reqSize;
 }
 
-static int get_rand_offset(int align){
+static int get_rand_offset(int align, int maxOffset, int unit){
     	int randNum;
 	if(align){
-	    randNum = (rand()%MAX_FILE_SIZE + 1)/SECTOR_SIZE*SECTOR_SIZE;
+	    //randNum = (rand()%MAX_FILE_SIZE + 1)/SECTOR_SIZE*SECTOR_SIZE;
+	    randNum = (rand()%maxOffset + 1)/unit*unit;
 	}
 	else
-	    randNum = rand()%MAX_FILE_SIZE;
+	    //randNum = rand()%MAX_FILE_SIZE;
+	    randNum = rand()%maxOffset;
         
-	print_log("%s : randNum : %d\n",__func__, randNum);
+	//print_log("%s : randNum : %d\n",__func__, randNum);
 	return randNum;
 }
 
 void main(int argc, char *argv[]){
 	int fd;
 	int fd2;
-
 	int rtn;
 	struct timeval stime, etime;
-	uint64_t ttime;
-
-	//struct aiocb *aiocbp[32];
-	int status;
-
-	char resultBuf[100]={""};;
-
-	int i;
+	uint64_t ttime=0;
+	char resultBuf[100]={""};
+	int i,j,k;
 	int loop;
-
-	char *nBuf;
+	char **nBuf;
 	int tmpReqSize;
 	int reqSize;
-	int offset;
+	int fileOffset;
+
+	int pageOffset;
+
+	typedef struct ioRequest_t{
+	    int id;
+	    int status;
+	    struct aiocb *aiocbp;
+	    struct timeval sTime;
+	    struct timeval eTime;
+	}ioRequest;
+	
+	ioRequest *ioList;
+	struct aiocb *aiocbList;
+	struct sigaction sa;
+	int reqNum = 2;
+	int remainReqNum;
+	int chunkSize;
+	char * wBuf;
 	
 	//init random seed
 	srand(time(NULL));
@@ -175,8 +185,102 @@ void main(int argc, char *argv[]){
 	    print_log("%s : File open error : %d\n", __func__, fd);
 	    exit(1);
 	}
+	
+	/* aio test */
+	ioList = calloc(reqNum, sizeof(ioRequest));
+	if(ioList == NULL){
+	    print_log("%s : ioList calloc error\n", __func__);
+	    exit(1);
+	}
+	aiocbList = calloc(reqNum, sizeof(struct aiocb));
+	if(aiocbList == NULL){
+	    print_log("%s : aiocbList calloc error\n", __func__);
+	    exit(1);
+	}
 
-	//for(tmpReqSize=512; tmpReqSize<=1*1024*1024; tmpReqSize*=2){
+	reqSize = mem_allocation(&wBuf, 128*1024, true);
+	fill_buffer(wBuf, reqSize);
+	lseek(fd, 0, SEEK_SET);
+	for(i=0; i<1000; i++)
+	    write(fd, wBuf, reqSize);
+
+	chunkSize = 4*1024;
+	for(i=0; i<reqNum; i++){
+	    ioList[i].id = i;
+	    ioList[i].status = EINPROGRESS;
+	    ioList[i].aiocbp = &aiocbList[i];
+	    
+	    nBuf = (char **)&(ioList[i].aiocbp->aio_buf);
+
+	    reqSize = mem_allocation(&(*nBuf), chunkSize, true);
+	    //fill_buffer(*nBuf, reqSize);
+
+	}
+	sleep(5);
+	loop = 10000;
+	for(k=chunkSize ; k<50*chunkSize; k+=chunkSize){
+	    gettimeofday(&ioList[0].sTime, NULL);
+	    for(j=0 ; j<loop; j++){
+		//fileOffset = get_rand_offset(true, 255*1024*1000, 4*1024);
+		fileOffset = 0;
+
+		for(i=0; i<reqNum; i++){
+		    fileOffset = i*k;
+		    //printf("%d ", fileOffset);
+		    io_initialize(ioList[i].aiocbp, fd, reqSize, fileOffset, i);
+		    //gettimeofday(&ioList[i].sTime, NULL);
+		    io_enqueue(DIR_READ, ioList[i].aiocbp);
+		}
+		//printf("\n");
+		remainReqNum = reqNum;
+
+		while(remainReqNum){
+
+		    for(i=0; i<reqNum; i++){
+			if(ioList[i].status == EINPROGRESS){
+			    ioList[i].status = aio_error(ioList[i].aiocbp);
+
+			    switch (ioList[i].status) {
+				case 0:
+				    //printf("I/O succeeded\n");
+				    break;
+				case EINPROGRESS:
+				    //printf(".");
+				    break;
+				case ECANCELED:
+				    printf("Canceled\n");
+				    break;
+				default:
+				    printf("aio_error\n");
+				    break;
+			    }
+			    if(ioList[i].status != EINPROGRESS){
+				//gettimeofday(&ioList[i].eTime, NULL);
+				remainReqNum--;
+			    }
+			}
+		    }
+		}
+		for(i=0; i<reqNum; i++){
+		    ioList[i].status = EINPROGRESS;
+		    //print_log("elapse time : %lld\n", utime_calculator(&ioList[i].sTime, &ioList[i].eTime));
+		    //ttime += utime_calculator(&ioList[i].sTime, &ioList[i].eTime);	    
+		}
+	    }
+	    gettimeofday(&ioList[0].eTime, NULL);
+	    ttime = utime_calculator(&ioList[0].sTime, &ioList[0].eTime);	    
+
+
+	    print_log("%s : total elapse time : %lld, loop : %d\n", __func__, ttime, loop);
+	    sprintf(resultBuf, "%10d, %10d, %10d\n", k, ttime, loop*chunkSize/ttime );
+	    printf("%10d, %10d, %10d\n", k, ttime, loop*4*chunkSize/ttime );
+	    lseek(fd, 0, SEEK_SET);
+	    write(fd2, resultBuf, sizeof(resultBuf));
+	    ttime = 0;
+	}
+	
+	/* Mapping granurarity checker */
+	/*
 	for(tmpReqSize=1*1024; tmpReqSize<256*1024; tmpReqSize+=1*1024){
 	    
 	    reqSize = mem_allocation(&nBuf, tmpReqSize, true);
@@ -184,13 +288,9 @@ void main(int argc, char *argv[]){
 	    for(loop=0; loop<100; loop++){
 		fill_buffer(nBuf, reqSize);
 
-		//for(i=0; i<reqSize; i++)
-		//print_log("%d", nBuf[i]);
-		//print_log("\n");
-
-		//offset = get_rand_offset(true);
+		//fileOffset = get_rand_offset(true, MAX_FILE_SIZE, SECTOR_SIZE);
 		lseek(fd, 0, SEEK_SET); 
-		//lseek(fd, offset, SEEK_SET); 
+		//lseek(fd, fileOffset, SEEK_SET); 
 
 		gettimeofday(&stime, NULL);
 		printf("WRITE : %d\n", write(fd, nBuf, reqSize));
@@ -201,33 +301,38 @@ void main(int argc, char *argv[]){
 
 		sprintf(resultBuf, "%10d, %10d, %20lld\n", reqSize, loop, ttime);
 		lseek(fd, sizeof(resultBuf), SEEK_SET);
-		//printf("choki: %s\n", resultBuf);
 		write(fd2, resultBuf, sizeof(resultBuf));
-		//printf("READ : %d\n", write(fd, nBuf, 512));
 		//usleep(7000);
 	    }
 	    free(nBuf);
 	}
+	*/
+	
+	/* align test */
+	/*
+	for(tmpReqSize=1*1024; tmpReqSize<=28*1024; tmpReqSize+=1*1024){
+	    reqSize = mem_allocation(&nBuf, tmpReqSize, true);
+	    for(pageOffset=0; pageOffset<10*1024; pageOffset+=1*1024){
+		for(loop=0; loop<100; loop++){
+		    fill_buffer(nBuf, reqSize);
+		    lseek(fd, pageOffset, SEEK_SET); 
+		    gettimeofday(&stime, NULL);
+		    printf("WRITE : %d\n", write(fd, nBuf, reqSize));
+		    fsync(fd);
+		    gettimeofday(&etime, NULL);
+		    ttime = utime_calculator(&stime, &etime);	    
+		    print_log("%s : total elapse time : %lld\n", __func__, ttime);
+
+		    sprintf(resultBuf, "%10d, %10d, %10d, %10lld\n",
+			    reqSize, pageOffset, loop, ttime);
+		    lseek(fd, sizeof(resultBuf), SEEK_SET);
+		    write(fd2, resultBuf, sizeof(resultBuf));
+		    usleep(5000);
+		}
+	    }
+	    free(nBuf);
+	}
+	*/
 	close(fd);
 	close(fd2);
-
-	/*
-	for(i=0; i<30; i++){
-	    aiocbp[i] = calloc(1, sizeof(struct aiocb));
-	    buf[i] = calloc(1, BUF_SIZE+1);
-	    memcpy(buf[i], "avasdfasdfas", 6);
-	    //io_initialize(aiocbp[i], fd, buf[i], BUF_SIZE, i*6, i);
-	    io_initialize(aiocbp[i], fd, buf[i], sizeof(buf), i*6, i);
-	    gettimeofday(&stime, NULL);
-
-	    io_enqueue(DIR_READ, aiocbp[i]);
-	    io_completion_handler(aiocbp[i]);
- 
- 	    gettimeofday(&etime, NULL);
-	    ttime = utime_calculator(&stime, &etime);	    
-            print_log("%s : total elapse time : %lld\n", __func__, ttime);
-	}*/
-
-
-
 }
